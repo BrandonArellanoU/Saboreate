@@ -19,10 +19,10 @@ parameters:
     type: boolean
     default: false
     description: "Forzar pruebas E2E aunque la rama no sea develop"
-  run_sonar:
+  simular_jenkins:
     type: boolean
-    default: true
-    description: "Ejecutar análisis estático en SonarCloud"
+    default: false
+    description: "Ejecutar SOLO la simulación del pipeline de Jenkins (para el informe comparativo)"
 
 # ---------------------------------------------------------------------
 # Executors reutilizables (modularidad)
@@ -90,6 +90,50 @@ commands:
               -d "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=${TEXTO}")
             echo ">>> [TELEGRAM API RESPUESTA]: $RESP"
 
+  medir:
+    description: "Ejecuta un comando y registra tiempo, CPU y memoria (cgroup del contenedor)"
+    parameters:
+      etapa:
+        type: string
+      comando:
+        type: string
+    steps:
+      - run:
+          name: "<< parameters.etapa >>"
+          command: |
+            mkdir -p /tmp/metricas
+            leer_cpu() { awk '/usage_usec/{print $2}' /sys/fs/cgroup/cpu.stat 2>/dev/null || cat /sys/fs/cgroup/cpuacct/cpuacct.usage 2>/dev/null | awk '{print int($1/1000)}' || echo 0; }
+            CPU0=$(leer_cpu); T0=$(date +%s%N)
+            set +e
+            ( set -e
+            << parameters.comando >>
+            )
+            RC=$?
+            set -e
+            T1=$(date +%s%N); CPU1=$(leer_cpu)
+            MEM=$(cat /sys/fs/cgroup/memory.peak 2>/dev/null || cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes 2>/dev/null || echo 0)
+            NODO=${CIRCLE_NODE_INDEX:-0}
+            awk -v e="<< parameters.etapa >>" -v j="$CIRCLE_JOB" -v n="$NODO" -v t0=$T0 -v t1=$T1 -v c0=$CPU0 -v c1=$CPU1 -v m=$MEM -v rc=$RC 'BEGIN{
+              w=(t1-t0)/1e9; c=(c1-c0)/1e6; p=(w>0)?100*c/w:0;
+              printf "%s,%s,%s,%.1f,%.1f,%.0f,%.0f,%s\n", j, n, e, w, c, p, m/1048576, rc }' >> /tmp/metricas/metricas.csv
+            echo "== METRICA: $(tail -1 /tmp/metricas/metricas.csv)  (job,nodo,etapa,seg,cpu_seg,cpu_%,mem_pico_MB,rc)"
+            exit $RC
+
+  reporte-metricas:
+    description: "Publica las métricas del job como artefacto"
+    steps:
+      - run:
+          name: "Reporte de métricas"
+          when: always
+          command: |
+            mkdir -p /tmp/metricas
+            echo "Núcleos visibles: $(nproc) | CPU max: $(cat /sys/fs/cgroup/cpu.max 2>/dev/null || echo n/d) | Mem max: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/d)"
+            echo "job,nodo,etapa,seg,cpu_seg,cpu_%,mem_pico_MB,rc"
+            cat /tmp/metricas/metricas.csv 2>/dev/null || true
+      - store_artifacts:
+          path: /tmp/metricas
+          destination: metricas
+
   notify-on-failure:
     description: "Alerta de fallo reutilizable para cualquier job"
     steps:
@@ -110,14 +154,15 @@ jobs:
           estado: "🚀 INICIADO"
           mensaje: "Pipeline iniciado (pipeline #<< pipeline.number >>)"
       - restore-maven-cache
-      - run:
-          name: "Compilar proyecto (mvn compile)"
-          command: mvn -B clean compile -DskipTests
+      - medir:
+          etapa: "Compilar proyecto (mvn compile)"
+          comando: mvn -B clean compile -DskipTests
       - save-maven-cache
       - persist_to_workspace:
           root: .
           paths:
             - target
+      - reporte-metricas
       - notify-on-failure
 
   unit-tests:
@@ -128,9 +173,9 @@ jobs:
       - restore-maven-cache
       - attach_workspace:
           at: .
-      - run:
-          name: "Pruebas unitarias + JaCoCo (divididas por tiempos)"
-          command: |
+      - medir:
+          etapa: "Pruebas unitarias + JaCoCo (divididas por tiempos)"
+          comando: |
             mkdir -p test-results
             CLASES=$(circleci tests glob "src/test/java/**/*Test.java" \
               | circleci tests split --split-by=timings --timings-type=filename \
@@ -157,6 +202,7 @@ jobs:
           paths:
             - target/site/jacoco
             - target/jacoco.exec
+      - reporte-metricas
       - notify-on-failure
 
   sonarcloud:
@@ -210,6 +256,40 @@ jobs:
           when: on_success
       - notify-on-failure
 
+  # ------------------------------------------------------------------
+  # SIMULACIÓN DEL PIPELINE DE JENKINS (mismo Jenkinsfile, mismo hardware)
+  # Reproduce: un solo agente, etapas en serie, repo Maven dentro del
+  # workspace (MAVEN_OPTS=-Dmaven.repo.local=.m2/repository) y cleanWs()
+  # => cada build arranca SIN caché. Comandos idénticos al Jenkinsfile.
+  # -----------------------------------------------------------------
+  jenkins-simulado:
+    executor: java17
+    environment:
+      MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+    steps:
+      - checkout   # J1. Integración al repo (checkout scm)
+      - medir:
+          etapa: "J2. Build (mvn clean compile -DskipTests)"
+          comando: mvn -B clean compile -DskipTests
+      - medir:
+          etapa: "J3. Pruebas unitarias (mvn clean test)"
+          comando: mvn -B clean test
+      - medir:
+          etapa: "J4. Análisis estático SonarCloud"
+          comando: |
+            if [ -z "${SONAR_TOKEN}" ]; then echo "Sin SONAR_TOKEN: etapa omitida (igual que en CircleCI)"; exit 0; fi
+            mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:sonar -Dsonar.projectKey=${SONAR_PROJECT_KEY} -Dsonar.organization=${SONAR_ORG} -Dsonar.host.url=${SONAR_HOST_URL} -Dsonar.token=${SONAR_TOKEN} -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+      - medir:
+          etapa: "J5. post always (junit + cleanWs)"
+          comando: |
+            mkdir -p test-results/junit
+            cp target/surefire-reports/*.xml test-results/junit/ 2>/dev/null || true
+            du -sh .m2/repository 2>/dev/null || true
+      - store_test_results:
+          path: test-results
+      - reporte-metricas
+      - notify-on-failure
+
   notify-success:
     docker:
       - image: cimg/base:stable
@@ -234,6 +314,8 @@ jobs:
 workflows:
   # Flujo principal: todas las ramas
   ci:
+    when:
+      not: << pipeline.parameters.simular_jenkins >>
     jobs:
       - build:
           filters: &ramas_ci
@@ -259,19 +341,30 @@ workflows:
   # Solo develop (o forzado por parámetro): pruebas E2E
   e2e:
     when:
-      or:
-        - equal: [develop, << pipeline.git.branch >>]
-        - << pipeline.parameters.run_e2e >>
+      and:
+        - not: << pipeline.parameters.simular_jenkins >>
+        - or:
+            - equal: [develop, << pipeline.git.branch >>]
+            - << pipeline.parameters.run_e2e >>
     jobs:
       - e2e-tests
 
   # Solo main: aprobación manual + empaquetado del WAR
   release:
     when:
-      equal: [main, << pipeline.git.branch >>]
+      and:
+        - not: << pipeline.parameters.simular_jenkins >>
+        - equal: [main, << pipeline.git.branch >>]
     jobs:
       - notify-hold
       - approve-release:
           type: approval
       - package:
           requires: [approve-release]
+
+  # Solo cuando se dispara con simular_jenkins = true
+  jenkins-simulado:
+    when: << pipeline.parameters.simular_jenkins >>
+    jobs:
+      - jenkins-simulado:
+          context: sonarcloud
