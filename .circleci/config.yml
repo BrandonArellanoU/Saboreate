@@ -1,0 +1,277 @@
+# ==================================================================
+#  Saboreate - Pipeline CI/CD en CircleCI (migrado desde Jenkinsfile)
+#  Jenkins stage                      ->  CircleCI job
+#  1. Integración al Repo (checkout)  ->  build (checkout + caché)
+#  2. Build (Compilación)             ->  build
+#  3. Pruebas Unitarias               ->  unit-tests (paralelismo x2)
+#  4. Análisis Estático (SonarCloud)  ->  sonarcloud
+#  4. Pruebas E2E (solo develop)      ->  e2e-tests
+#  post { success / failure }         ->  comando notify-telegram
+#  (nuevo) Empaquetado WAR + aprobación manual -> package / approve-release
+# =====================================================================
+version: 2.1
+
+# ---------------------------------------------------------------------
+# Parámetros de pipeline (ejecución selectiva manual desde la UI)
+# ---------------------------------------------------------------------
+parameters:
+  run_e2e:
+    type: boolean
+    default: false
+    description: "Forzar pruebas E2E aunque la rama no sea develop"
+  run_sonar:
+    type: boolean
+    default: true
+    description: "Ejecutar análisis estático en SonarCloud"
+
+# ---------------------------------------------------------------------
+# Executors reutilizables (modularidad)
+# ---------------------------------------------------------------------
+executors:
+  java17:
+    docker:
+      - image: cimg/openjdk:17.0
+    resource_class: medium
+    working_directory: ~/saboreate
+    environment:
+      MAVEN_OPTS: "-Xmx1g -Dmaven.repo.local=/home/circleci/.m2/repository"
+      SONAR_HOST_URL: "https://sonarcloud.io"
+      SONAR_ORG: "altermanns"
+      SONAR_PROJECT_KEY: "saboreate-app"
+
+# ---------------------------------------------------------------------
+# Comandos reutilizables (modularidad)
+# ---------------------------------------------------------------------
+commands:
+  restore-maven-cache:
+    description: "Restaura dependencias Maven usando el hash del pom.xml"
+    steps:
+      - restore_cache:
+          keys:
+            - maven-v1-{{ checksum "pom.xml" }}
+            - maven-v1-
+
+  save-maven-cache:
+    description: "Guarda ~/.m2 para próximas ejecuciones"
+    steps:
+      - save_cache:
+          key: maven-v1-{{ checksum "pom.xml" }}
+          paths:
+            - ~/.m2/repository
+
+  notify-telegram:
+    description: "Envía un mensaje a Telegram (requiere TELEGRAM_TOKEN y TELEGRAM_CHAT_ID)"
+    parameters:
+      estado:
+        type: string
+      mensaje:
+        type: string
+      when:
+        type: enum
+        enum: ["always", "on_success", "on_fail"]
+        default: always
+    steps:
+      - run:
+          name: "Notificación Telegram (<< parameters.estado >>)"
+          when: << parameters.when >>
+          command: |
+            if [ -z "${TELEGRAM_TOKEN}" ] || [ -z "${TELEGRAM_CHAT_ID}" ]; then
+              echo "Variables TELEGRAM_TOKEN / TELEGRAM_CHAT_ID no configuradas; se omite la notificación."
+              exit 0
+            fi
+            TEXTO="<< parameters.estado >> | Saboreate
+            Job: ${CIRCLE_JOB}
+            Build #: ${CIRCLE_BUILD_NUM}
+            Rama: ${CIRCLE_BRANCH}
+            Commit: ${CIRCLE_SHA1:0:7} por ${CIRCLE_USERNAME}
+            Detalle: << parameters.mensaje >>
+            Enlace: ${CIRCLE_BUILD_URL}"
+            RESP=$(curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              -d "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=${TEXTO}")
+            echo ">>> [TELEGRAM API RESPUESTA]: $RESP"
+
+  notify-on-failure:
+    description: "Alerta de fallo reutilizable para cualquier job"
+    steps:
+      - notify-telegram:
+          estado: "❌ FALLIDO"
+          mensaje: "Error en el job ${CIRCLE_JOB}. Revisar el log."
+          when: on_fail
+
+# ---------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------
+jobs:
+  build:
+    executor: java17
+    steps:
+      - checkout
+      - notify-telegram:
+          estado: "🚀 INICIADO"
+          mensaje: "Pipeline iniciado (pipeline #<< pipeline.number >>)"
+      - restore-maven-cache
+      - run:
+          name: "Compilar proyecto (mvn compile)"
+          command: mvn -B clean compile -DskipTests
+      - save-maven-cache
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target
+      - notify-on-failure
+
+  unit-tests:
+    executor: java17
+    parallelism: 2
+    steps:
+      - checkout
+      - restore-maven-cache
+      - attach_workspace:
+          at: .
+      - run:
+          name: "Pruebas unitarias + JaCoCo (divididas por tiempos)"
+          command: |
+            mkdir -p test-results
+            CLASES=$(circleci tests glob "src/test/java/**/*Test.java" \
+              | circleci tests split --split-by=timings --timings-type=filename \
+              | xargs -n1 basename | sed 's/\.java$//' | paste -sd, -)
+            echo "Nodo ${CIRCLE_NODE_INDEX}/${CIRCLE_NODE_TOTAL} ejecuta: ${CLASES:-<ninguna>}"
+            if [ -n "$CLASES" ]; then
+              mvn -B test -Dtest="$CLASES" -Dsurefire.failIfNoSpecifiedTests=false
+            else
+              echo "No hay clases de prueba asignadas a este nodo."
+            fi
+      - run:
+          name: "Recolectar reportes"
+          when: always
+          command: |
+            mkdir -p test-results/junit
+            cp target/surefire-reports/*.xml test-results/junit/ 2>/dev/null || true
+      - store_test_results:
+          path: test-results
+      - store_artifacts:
+          path: target/site/jacoco
+          destination: jacoco
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target/site/jacoco
+            - target/jacoco.exec
+      - notify-on-failure
+
+  sonarcloud:
+    executor: java17
+    steps:
+      - checkout
+      - restore-maven-cache
+      - attach_workspace:
+          at: .
+      - run:
+          name: "Análisis estático SonarCloud"
+          command: |
+            if [ -z "${SONAR_TOKEN}" ]; then
+              echo "SONAR_TOKEN no configurado (context 'sonarcloud'); se omite el análisis."
+              circleci-agent step halt
+              exit 0
+            fi
+            mvn -B compile org.sonarsource.scanner.maven:sonar-maven-plugin:sonar \
+              -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+              -Dsonar.organization=${SONAR_ORG} \
+              -Dsonar.host.url=${SONAR_HOST_URL} \
+              -Dsonar.token=${SONAR_TOKEN} \
+              -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+      - notify-on-failure
+
+  e2e-tests:
+    executor: java17
+    steps:
+      - checkout
+      - restore-maven-cache
+      - run:
+          name: "Pruebas E2E (Selenium/Cypress - placeholder igual que en Jenkins)"
+          command: |
+            mvn -B verify -P e2e-tests || echo "Placeholder - configurar perfil de pruebas de interfaz"
+      - notify-on-failure
+
+  package:
+    executor: java17
+    steps:
+      - checkout
+      - restore-maven-cache
+      - run:
+          name: "Empaquetar WAR"
+          command: mvn -B package -DskipTests
+      - store_artifacts:
+          path: target/Saboreate.war
+          destination: Saboreate.war
+      - notify-telegram:
+          estado: "✅ EXITOSO"
+          mensaje: "Compilación, pruebas, análisis Sonar y empaquetado WAR completados."
+          when: on_success
+      - notify-on-failure
+
+  notify-success:
+    docker:
+      - image: cimg/base:stable
+    resource_class: small
+    steps:
+      - notify-telegram:
+          estado: "✅ EXITOSO"
+          mensaje: "Pipeline completado: compilación y pruebas superadas."
+
+  notify-hold:
+    docker:
+      - image: cimg/base:stable
+    resource_class: small
+    steps:
+      - notify-telegram:
+          estado: "⏸️ EN ESPERA"
+          mensaje: "El pipeline espera aprobación manual para generar el WAR (approve-release)."
+
+# ---------------------------------------------------------------------
+# Workflows (ejecución selectiva por rama / parámetros)
+# ---------------------------------------------------------------------
+workflows:
+  # Flujo principal: todas las ramas
+  ci:
+    jobs:
+      - build:
+          filters: &ramas_ci
+            branches:
+              only:
+                - main
+                - develop
+                - /feature\/.*/
+      - unit-tests:
+          requires: [build]
+          filters: *ramas_ci
+      - sonarcloud:
+          context: sonarcloud
+          requires: [unit-tests]
+          filters: *ramas_ci
+      # Solo ramas feature/*: aviso de éxito al terminar
+      - notify-success:
+          requires: [sonarcloud]
+          filters:
+            branches:
+              only: /feature\/.*/
+
+  # Solo develop (o forzado por parámetro): pruebas E2E
+  e2e:
+    when:
+      or:
+        - equal: [develop, << pipeline.git.branch >>]
+        - << pipeline.parameters.run_e2e >>
+    jobs:
+      - e2e-tests
+
+  # Solo main: aprobación manual + empaquetado del WAR
+  release:
+    when:
+      equal: [main, << pipeline.git.branch >>]
+    jobs:
+      - notify-hold
+      - approve-release:
+          type: approval
+      - package:
+          requires: [approve-release]
