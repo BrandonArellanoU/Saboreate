@@ -48,14 +48,14 @@ commands:
     steps:
       - restore_cache:
           keys:
-            - maven-v1-{{ checksum "pom.xml" }}
-            - maven-v1-
+            - maven-v2-{{ checksum "pom.xml" }}
+            - maven-v2-
 
   save-maven-cache:
     description: "Guarda ~/.m2 para próximas ejecuciones"
     steps:
       - save_cache:
-          key: maven-v1-{{ checksum "pom.xml" }}
+          key: maven-v2-{{ checksum "pom.xml" }}
           paths:
             - ~/.m2/repository
 
@@ -156,7 +156,10 @@ jobs:
       - restore-maven-cache
       - medir:
           etapa: "Compilar proyecto (mvn compile)"
-          comando: mvn -B clean compile -DskipTests
+          comando: |
+            # Precarga dependencias Y plugins (surefire, jacoco, war) para que la caché los incluya
+            mvn -B -q dependency:go-offline || echo "go-offline incompleto: se continúa"
+            mvn -B clean compile -DskipTests
       - save-maven-cache
       - persist_to_workspace:
           root: .
@@ -256,7 +259,7 @@ jobs:
           when: on_success
       - notify-on-failure
 
-  # ------------------------------------------------------------------
+  # -----------------------------------------------------------------
   # SIMULACIÓN DEL PIPELINE DE JENKINS (mismo Jenkinsfile, mismo hardware)
   # Reproduce: un solo agente, etapas en serie, repo Maven dentro del
   # workspace (MAVEN_OPTS=-Dmaven.repo.local=.m2/repository) y cleanWs()
