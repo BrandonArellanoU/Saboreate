@@ -157,8 +157,7 @@ jobs:
       - medir:
           etapa: "Compilar proyecto (mvn compile)"
           comando: |
-            # Precarga dependencias Y plugins (surefire, jacoco, war) para que la caché los incluya
-            mvn -B -q dependency:go-offline || echo "go-offline incompleto: se continúa"
+            # (go-offline retirado: medido +5 s por build sin mejorar las pruebas)
             mvn -B clean compile -DskipTests
       - save-maven-cache
       - persist_to_workspace:
